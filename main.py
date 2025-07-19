@@ -1,10 +1,14 @@
 import cv2
 import numpy as np
-import datetime
+import threading
 import tkinter as tk
+import cv2
+
+from datetime import datetime
 from tkinter import ttk
 from PIL import Image, ImageTk
-import threading
+from typing import List
+
 
 def describe_image(img):
     # Getting greyscale to make calculations faster
@@ -12,9 +16,9 @@ def describe_image(img):
     # ensure effect of different lighting per frames is minimal
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     img_normalised = clahe.apply(img_grey)
-    sift = cv2.SIFT_create()
-    return sift.detectAndCompute(img_normalised, None)
-
+    mask = np.ones(img_normalised.shape, dtype=np.uint8)
+    sift = cv2.SIFT.create()
+    return sift.detectAndCompute(img_normalised, mask)
 
 def get_matches(des1, des2):
     # Using brute force matcher for simple speed when working
@@ -25,9 +29,7 @@ def get_matches(des1, des2):
     good_matches = [m1 for m1, m2 in matches if m1.distance < 0.5 * m2.distance]    
     return good_matches
 
-
-# Reference function for simple frame extraction
-# with stride
+# Reference function for simple frame extraction with stride
 def extract_keyframes_naive(video_path):
     frames = list()
     cap = cv2.VideoCapture(video_path)
@@ -35,8 +37,8 @@ def extract_keyframes_naive(video_path):
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     _, last_frame = cap.read()
     frames.append(last_frame)
-    # skip a certain amount of frames to speed up computation
-    frameskip = int(fps / 1.5)
+    frameskip = int(fps / 1.5) # skip a certain amount of frames to speed up computation
+
     i = 0
     while True:
         ret, last_frame = cap.read()
@@ -49,9 +51,8 @@ def extract_keyframes_naive(video_path):
     print(f"frame num: {len(frames)}")
     return frames
 
-
 # Intelligent frame extraction using feature threshold
-def extract_keyframes(video_path):
+def extract_keyframes(video_path: str):
     frames = list()
     cap = cv2.VideoCapture(video_path)
     _, last_frame = cap.read()
@@ -77,11 +78,16 @@ def extract_keyframes(video_path):
     print(f"frame num: {len(frames)}")
     return frames
 
-
-def get_homography(matches, kp_1, kp_2):
+def get_source_destination_points(matches: List[cv2.DMatch], kp_1: List[cv2.KeyPoint], kp_2: List[cv2.KeyPoint]):
     # Storing coordinates of points corresponding to the matches found in both the images
-    src_pts = np.float32([kp_1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp_2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    pts_1 = [kp_1[m.queryIdx].pt for m in matches]
+    pts_2 = [kp_2[m.trainIdx].pt for m in matches]
+    src_pts = np.array(pts_1, dtype=np.float32).reshape(-1, 1, 2)
+    dst_pts = np.array(pts_2, dtype=np.float32).reshape(-1, 1, 2)
+    return src_pts, dst_pts
+
+def get_homography(matches: List[cv2.DMatch], kp_1: List[cv2.KeyPoint], kp_2:  List[cv2.KeyPoint]):
+    src_pts, dst_pts = get_source_destination_points(matches, kp_1, kp_2)
 
     if len(src_pts) < 4 or len(dst_pts) < 4:
         return None
@@ -93,7 +99,7 @@ def get_homography(matches, kp_1, kp_2):
 
 # Inspired by:
 # https://github.com/KEDIARAHUL135/PanoramaStitching/blob/master/main.py
-# Used instead of having a estimated offset range as in lab 4
+# Used instead of having a estimated offset range
 # Calculates offset based on the image coordinates after transformation with the homography matrix
 def get_modified_size_and_homography(H, img_base_shape, img_add_shape):
     h1, w1 = img_base_shape
@@ -101,10 +107,10 @@ def get_modified_size_and_homography(H, img_base_shape, img_add_shape):
     
     # Storing the initial 4 corners of the image
     # In order of: TL, TR, BR, BL
-    initial_image_corners = np.float32([[0,      0     ],
-                                        [w2 - 1, 0     ],
-                                        [w2 - 1, h2 - 1],
-                                        [0,      h2 - 1]])
+    initial_image_corners = np.array([[0,      0     ],
+                                      [w2 - 1, 0     ],
+                                      [w2 - 1, h2 - 1],
+                                      [0,      h2 - 1]], dtype=np.float32)
 
     # In Homogenous coordinates so can transform with homography matrix
     initial_points_homogenous = np.vstack((initial_image_corners.T, np.array([1, 1, 1, 1])))
@@ -132,10 +138,10 @@ def get_modified_size_and_homography(H, img_base_shape, img_add_shape):
     y += offset[0]
 
     # Get the correct representation of the new coordinates
-    new_points = np.float32(np.array([x, y]).T)
+    new_points = np.vstack((x, y)).T.astype(np.float32)  # shape (4, 2), type float32
 
     ## Recalculate homography from the newly calculated points and the original position
-    H = cv2.getPerspectiveTransform(initial_image_corners, new_points)
+    H = cv2.getPerspectiveTransform(initial_image_corners.astype(np.float32), new_points)
 
     # Get whatever sizes are needed to fit the image without cropping
     new_width  = max(max_x - min_x, w1 + abs(min_x))
@@ -151,12 +157,12 @@ def estimate_focal_length(images):
     for i in range(0, len(images) - 1):
         kp_1, des_1 = describe_image(images[i])
         kp_2, des_2 = describe_image(images[i + 1])
-
-        # Get the fundamental matrix from the the two images
         matches = get_matches(des_1, des_2)
-        src_pts = np.float32([kp_1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp_2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+        # Get the fundamental matrix from the two images
+        src_pts, dst_pts = get_source_destination_points(matches, list(kp_1), list(kp_2))
         fundamental_matrix, _ = cv2.findFundamentalMat(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
         # Calculate the epipolar lines
         lines = cv2.computeCorrespondEpilines(dst_pts, 2, fundamental_matrix)
         lines = lines.reshape(-1, 3) # squeeze down into a 1d array
@@ -171,7 +177,6 @@ def estimate_focal_length(images):
     # Multiply by constant to decrease distortion (kinda just trial and error tbh)
     return np.mean(focal_lengths) * np.log(np.pi * np.pi)
 
-
 def match_extents(img):
     # First, ensure that canvas extents matches image extents
     grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -183,7 +188,6 @@ def match_extents(img):
     cropped = img[min_y:max_y, min_x:max_x]
     return cropped, min_x, max_x, min_y, max_y
     
-
 def crop_first_column(img, min_x, max_x, min_y):
     first_column = img[:, 0, :]
     # Find the top-most non-black pixel and bottom-most non-black pixel
@@ -235,8 +239,8 @@ def crop_image(img):
     y_start = 0
     y_end, x_end = cropped.shape[:2]
 
-    has_black = np.any(grey == 0)
-    while has_black:
+    temp = cropped
+    while np.any(grey == 0):
         # Only reduce ROI on sections with background
         if crop_top:
             y_start+=1
@@ -246,11 +250,9 @@ def crop_image(img):
             x_end-=1
         temp = cropped[y_start: y_end, 0 :x_end]
         grey = cv2.cvtColor(temp, cv2.COLOR_BGR2GRAY)
-        has_black = np.any(grey == 0)
     cropped = temp
 
     return cropped
-
 
 # Blend the original image and the addition image togther
 def blend_images(img_base, img_add, mask):
@@ -264,7 +266,6 @@ def blend_images(img_base, img_add, mask):
     non_overlapping_region = cv2.bitwise_and(img_base, mask)
     blended = cv2.bitwise_or(img_add, non_overlapping_region)
     return blended
-
 
 def bilinear_interpolation(x_coord_t, y_coord_t, x_t, y_t, img):
     x_t_int = x_t.astype(int)
@@ -291,7 +292,6 @@ def bilinear_interpolation(x_coord_t, y_coord_t, x_t, y_t, img):
                                            (weight_bl[:, np.newaxis] * img[y_t_int + 1, x_t_int,     :])
     
     return transformed
-
 
 ## Getting transformed coordinates on cylindrical plane
 ## Uses the following standard equations:
@@ -357,7 +357,6 @@ def cylinder_project(img, f):
 
     return transformed, img_add_mask
 
-
 def stitch_images(images):
     #focal_length = estimate_focal_length(images)
     focal_length = 758.6 ## Using known focal length for my camera
@@ -373,7 +372,7 @@ def stitch_images(images):
         matches = get_matches(des_1, des_2)
 
         # Finding initial homography matrix
-        H = get_homography(matches, kp_1, kp_2)
+        H = get_homography(matches, list(kp_1), list(kp_2))
         if H is None:
             break
         
@@ -383,7 +382,7 @@ def stitch_images(images):
         new_size, offset, H = get_modified_size_and_homography(H, (stitched_h, stitched_w), img_add_cyl.shape[:2])
 
         # basic image combination
-        # should use something like gain compensation or multi-level banding
+        ## should use something like gain compensation or multi-level banding
         image_add_trans = cv2.warpPerspective(img_add_cyl, H, new_size) 
         img_add_mask_trans = cv2.warpPerspective(img_add_mask, H, new_size) 
         base_image_trans = np.zeros((new_size[1], new_size[0], 3), dtype=np.uint8)
@@ -393,8 +392,6 @@ def stitch_images(images):
     stitched_image = crop_image(stitched_image)
     return stitched_image
 
-
-## Class used for UI
 class AppUI:
     def __init__(self, root):
         self.root = root
@@ -443,7 +440,7 @@ class AppUI:
                     break
                 image = self.cv_to_tk_image(frame)
                 self.video_label.config(image=image)
-                self.video_label.image = image
+                self.video_image = image
                 self.root.update() # Ensure UI doesnt hang
                 self.root.after(10) # Play at correct speed
 
@@ -463,7 +460,7 @@ class AppUI:
         if video_path:
             images = extract_keyframes_naive(video_path)
             panorama_image = stitch_images(images)
-            time = datetime.datetime.now()
+            time = datetime.now()
             time_str = time.strftime("%Y-%m-%d_%H-%M-%S")
             cv2.imwrite(f"results/test_{time_str}.png", panorama_image)
             resized_image = self.resize_image_display(panorama_image)
@@ -473,13 +470,12 @@ class AppUI:
     # Callback after finished
     def update_ui(self, image):
         self.panorama_image_label.config(image=image)
-        self.panorama_image_label.image = image
+        self.panorama_image = image
 
     def generate_panorama(self):
         # Start the generate_panorama_thread function on a separate thread
         # avoids hanging of main programs
         threading.Thread(target=self.generate_panorama_thread, daemon=True).start()
-
 
 if __name__ == '__main__':
     root = tk.Tk()
